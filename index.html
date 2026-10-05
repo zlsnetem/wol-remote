@@ -457,10 +457,25 @@ function connect(){
     else if(m.startsWith('alive:')){
       const who = m.slice(6).trim();
       log('🟢 在线 · ' + who);
-      // ★ 记下这台设备"刚刚应答过"
+      // ★ 通道 A：记下这台设备"刚刚应答过"
       if(who){
         aliveSeen[who] = Date.now();
         refreshDevStatus();
+      }
+    }
+    else if(m.startsWith('st:')){
+      // ★ 通道 B：板子探测结果 st:名字|IP|1或0
+      const body = m.slice(3);
+      const parts = body.split('|');
+      if(parts.length >= 3){
+        const nm = (parts[0] || '').trim();
+        const ip = (parts[1] || '').trim();
+        const up = parts[2].trim() === '1';
+        log(`🔍 板子探测 · ${nm} (${ip}) → ${up ? '🟢 在线' : '⚫ 离线'}`);
+        feedProbe(nm, ip, up);
+        refreshDevStatus();
+      } else {
+        log('📨 ' + m);
       }
     }
     else
@@ -474,17 +489,31 @@ function connect(){
 }
 
 /* ==================== 在线状态（开机 / 关机）====================
-   原理：网页每隔一会儿喊一声 ping，
-        开机的电脑（值班员）和板子会回一句 alive:名字。
-        谁答了 = 谁开着；超过 45 秒没答 = 关着。
+   ★ 双通道判断，谁先说话算谁的：
+
+   【通道 A】网页自己喊 ping → 开机的电脑（值班员）会回 alive:名字
+            优点：快（20 秒内）；缺点：电脑上必须装了值班员
+
+   【通道 B】板子自己 ping 电脑 → 回 st:名字|IP|1或0
+            优点：电脑上什么都不用装，连 NAS 也能看见
+            缺点：稍慢（板子 60 秒探一次）
+
+   两个合起来，覆盖最全。
 ================================================================ */
-const PING_EVERY = 20000;   // 每 20 秒问一次
-const ALIVE_TTL  = 45000;   // 45 秒没应答就算离线
-let aliveSeen = {};         // { "示例电脑": 1530000000000 }
+const PING_EVERY = 20000;   // 网页每 20 秒问一次
+const ALIVE_TTL  = 45000;   // alive 应答 45 秒内算有效
+const STS_TTL    = 150000;  // 板子探测结果 150 秒内算有效（它 60 秒一轮）
+let aliveSeen = {};         // { "P310": 时间戳 }        —— 通道 A
+let probeSeen = {};         // { "192.168.0.4": {up:true, t:时间戳} } —— 通道 B
 let pingTimer = null;
 // 方便调试（也方便你在浏览器控制台看状态）
 window.aliveSeen = aliveSeen;
-window.__wolDebug = ()=>({ aliveSeen, devices: devs.map(d=>({name:d.name, online:isOnline(d)})) });
+window.probeSeen = probeSeen;
+window.__wolDebug = ()=>({
+  alive: aliveSeen,
+  probe: probeSeen,
+  devices: devs.map(d=>({name:d.name, ip:d.ip, online:isOnline(d)}))
+});
 
 function askWhoIsAlive(){
   if(!cli || !cli.connected) return;
@@ -492,25 +521,38 @@ function askWhoIsAlive(){
   log('📡 查询设备状态…');
 }
 
+/** 通道 B：板子报上来的探测结果 */
+function feedProbe(name, ip, up){
+  const t = Date.now();
+  if(ip)   probeSeen[ip] = {up:!!up, t:t};
+  if(name) probeSeen['n:' + name] = {up:!!up, t:t};
+}
+
 /** 判断某台设备现在是不是开机状态 */
 function isOnline(d){
   const now = Date.now();
+
+  // ---- 通道 B：板子探测过的 IP 或名字 ----
+  if(d.ip && probeSeen[d.ip] && now - probeSeen[d.ip].t < STS_TTL) {
+    if(probeSeen[d.ip].up) return true;
+  }
+  if(d.name && probeSeen['n:' + d.name] && now - probeSeen['n:' + d.name].t < STS_TTL) {
+    if(probeSeen['n:' + d.name].up) return true;
+  }
+
+  // ---- 通道 A：电脑值班员回的 alive ----
   const targets = [];
-  // ① 云端标识（最精确 —— 值班员报上来的名字）
   if(d.cloud) targets.push(String(d.cloud).trim());
-  // ② 设备名字本身
   if(d.name)  targets.push(String(d.name).trim());
-  // ③ 去掉中文括号后缀，比如 "书房电脑（台式）" → "书房电脑"
   if(d.name)  targets.push(String(d.name).replace(/[（(].*?[)）]/g,'').trim());
 
   for(const who in aliveSeen){
-    if(now - aliveSeen[who] > ALIVE_TTL) continue;      // 超时的不算
-    const w = who.trim();
+    if(now - aliveSeen[who] > ALIVE_TTL) continue;
+    const w = String(who).trim();
     for(const t of targets){
       if(!t) continue;
-      if(w === t) return true;                           // 完全一样
-      if(w.toLowerCase() === t.toLowerCase()) return true; // 忽略大小写
-      // 互相包含（"书房电脑" 与 "书房电脑（台式）" 这类）
+      if(w === t) return true;
+      if(w.toLowerCase() === t.toLowerCase()) return true;
       if(w.length >= 3 && t.length >= 3 && (w.includes(t) || t.includes(w))) return true;
     }
   }
